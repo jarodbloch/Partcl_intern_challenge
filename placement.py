@@ -246,6 +246,366 @@ def generate_placement_input(num_macros, num_std_cells):
 
 # ======= OPTIMIZATION CODE (edit this part) =======
 
+# ==== 2D PACKING ALGORITHMS ====
+def skyline_packing_placement(cell_features, margin=0):
+    """
+    Simple skyline packing for initial placement with zero overlaps.
+    Uses a greedy bottom-left heuristic to pack rectangles efficiently.
+    
+    Args:
+        cell_features: [N, 6] tensor with [area, num_pins, x, y, width, height]
+        margin: Minimum spacing between cells
+        
+    Returns:
+        Updated cell_features with new (x, y) positions
+    """
+    N = cell_features.shape[0]
+    if N == 0:
+        return cell_features
+    
+    # Clone to avoid modifying original
+    cell_features = cell_features.clone()
+    
+    # Extract dimensions
+    widths = cell_features[:, CellFeatureIdx.WIDTH]
+    heights = cell_features[:, CellFeatureIdx.HEIGHT]
+    areas = cell_features[:, CellFeatureIdx.AREA]
+    
+    # Sort by area (largest first for better packing)
+    sorted_indices = torch.argsort(areas, descending=True)
+    
+    # Calculate bin width from total area
+    total_area = areas.sum().item()
+    bin_width = (total_area * 1.3 * 1.6) ** 0.5  # Extra space to ensure everything fits
+    
+    # Skyline: list of (x_start, y_height, width) tuples
+    skyline = [[0.0, 0.0, bin_width]]
+    
+    # Pack each cell
+    for idx in sorted_indices:
+        w = widths[idx].item() + 2 * margin
+        h = heights[idx].item() + 2 * margin
+        
+        # Find best position: lowest y first, then leftmost x
+        best_x = None
+        best_y = float('inf')
+        best_idx = -1
+        
+        for i in range(len(skyline)):
+            seg_x, seg_y, seg_w = skyline[i]
+            
+            # Can't fit if starting position is too far right
+            if seg_x + w > bin_width:
+                continue
+            
+            # Find the maximum y across all segments this rect would cover
+            y_max = seg_y
+            x_end = seg_x + w
+            
+            for j in range(i, len(skyline)):
+                if skyline[j][0] >= x_end:
+                    break
+                y_max = max(y_max, skyline[j][1])
+            
+            # Update best position
+            if y_max < best_y or (y_max == best_y and seg_x < best_x):
+                best_y = y_max
+                best_x = seg_x
+                best_idx = i
+        
+        # Fallback if no position found (should not happen with enough bin_width)
+        if best_x is None:
+            best_x = 0.0
+            best_y = max(seg[1] for seg in skyline)
+        
+        # Build new skyline after placing rectangle
+        x_rect_end = best_x + w
+        new_skyline = []
+        
+        # Add new segment for the placed rectangle
+        new_seg_added = False
+        
+        for seg_x, seg_y, seg_w in skyline:
+            seg_x_end = seg_x + seg_w
+            
+            # Case 1: Segment entirely before rectangle
+            if seg_x_end <= best_x:
+                new_skyline.append([seg_x, seg_y, seg_w])
+            
+            # Case 2: Segment entirely after rectangle
+            elif seg_x >= x_rect_end:
+                if not new_seg_added:
+                    new_skyline.append([best_x, best_y + h, w])
+                    new_seg_added = True
+                new_skyline.append([seg_x, seg_y, seg_w])
+            
+            # Case 3: Segment partially before rectangle (left side)
+            elif seg_x < best_x < seg_x_end:
+                # Keep the left part
+                new_skyline.append([seg_x, seg_y, best_x - seg_x])
+                
+                # Add rectangle segment if not added yet
+                if not new_seg_added:
+                    new_skyline.append([best_x, best_y + h, w])
+                    new_seg_added = True
+                
+                # If segment extends past rectangle, keep right part
+                if seg_x_end > x_rect_end:
+                    new_skyline.append([x_rect_end, seg_y, seg_x_end - x_rect_end])
+            
+            # Case 4: Segment partially after rectangle (right side)
+            elif seg_x < x_rect_end < seg_x_end:
+                if not new_seg_added:
+                    new_skyline.append([best_x, best_y + h, w])
+                    new_seg_added = True
+                new_skyline.append([x_rect_end, seg_y, seg_x_end - x_rect_end])
+            
+            # Case 5: Segment completely covered by rectangle - skip it
+        
+        # Add rectangle segment if haven't yet (edge case)
+        if not new_seg_added:
+            new_skyline.append([best_x, best_y + h, w])
+        
+        # Merge adjacent segments with same height
+        merged = []
+        for seg in new_skyline:
+            if merged and abs(merged[-1][1] - seg[1]) < 1e-9 and abs(merged[-1][0] + merged[-1][2] - seg[0]) < 1e-9:
+                # Merge with previous
+                merged[-1][2] += seg[2]
+            else:
+                merged.append(seg)
+        
+        skyline = merged
+        
+        # Store CENTER position of cell (not corner)
+        cell_features[idx, CellFeatureIdx.X] = best_x + w/2 - margin
+        cell_features[idx, CellFeatureIdx.Y] = best_y + h/2 - margin
+    
+    return cell_features
+
+def shelf_packing_placement(cell_features, margin=0.0):
+    """
+    Shelf packing: simplified skyline that packs in horizontal rows.
+    Good balance of simplicity and efficiency.
+    
+    Args:
+        cell_features: [N, 6] tensor with cell properties
+        margin: Spacing between cells
+        
+    Returns:
+        Updated cell_features with positions
+    """
+    N = cell_features.shape[0]
+    if N == 0:
+        return cell_features
+    
+    cell_features = cell_features.clone()
+    
+    widths = cell_features[:, CellFeatureIdx.WIDTH]
+    heights = cell_features[:, CellFeatureIdx.HEIGHT]
+    areas = cell_features[:, CellFeatureIdx.AREA]
+    
+    # Sort by height (tallest first) for better shelf packing
+    sorted_indices = torch.argsort(heights, descending=True)
+    
+    # Calculate target width
+    total_area = areas.sum().item()
+    target_width = (total_area * 1.25 * 1.5) ** 0.5
+    
+    # Shelf packing state
+    shelf_x = 0.0        # Current x position in shelf
+    shelf_y = 0.0        # Bottom of current shelf
+    shelf_height = 0.0   # Height of tallest item in current shelf
+    
+    for idx in sorted_indices:
+        w = widths[idx].item() + 2 * margin
+        h = heights[idx].item() + 2 * margin
+        
+        # Start new shelf if this item doesn't fit
+        if shelf_x + w > target_width and shelf_x > 0:
+            shelf_x = 0.0
+            shelf_y += shelf_height
+            shelf_height = h
+        else:
+            shelf_height = max(shelf_height, h)
+        
+        # Place cell at center
+        cell_features[idx, CellFeatureIdx.X] = shelf_x + w/2 - margin
+        cell_features[idx, CellFeatureIdx.Y] = shelf_y + h/2 - margin
+        
+        # Advance x position
+        shelf_x += w
+    
+    return cell_features
+
+def rects_overlap(a, b, eps=1e-9):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return not (ax + aw <= bx + eps or bx + bw <= ax + eps or
+                ay + ah <= by + eps or by + bh <= ay + eps)
+
+def contained(a, b, eps=1e-9):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return ax + eps >= bx and ay + eps >= by and ax + aw <= bx + bw + eps and ay + ah <= by + bh + eps
+
+def merge_free_rects(free_rects, eps=1e-9):
+    # simple O(n^2) merge of adjacent rectangles with same edge
+    merged = True
+    while merged:
+        merged = False
+        n = len(free_rects)
+        i = 0
+        while i < n:
+            a = free_rects[i]
+            j = i + 1
+            while j < n:
+                b = free_rects[j]
+                # merge horizontally
+                if abs(a[1] - b[1]) < eps and abs(a[3] - b[3]) < eps and (abs(a[0] + a[2] - b[0]) < eps or abs(b[0] + b[2] - a[0]) < eps):
+                    x = min(a[0], b[0]); y = a[1]; w = max(a[0]+a[2], b[0]+b[2]) - x; h = a[3]
+                    free_rects[i] = [x, y, w, h]; free_rects.pop(j); n -= 1; merged = True; continue
+                # merge vertically
+                if abs(a[0] - b[0]) < eps and abs(a[2] - b[2]) < eps and (abs(a[1] + a[3] - b[1]) < eps or abs(b[1] + b[3] - a[1]) < eps):
+                    x = a[0]; y = min(a[1], b[1]); w = a[2]; h = max(a[1]+a[3], b[1]+b[3]) - y
+                    free_rects[i] = [x, y, w, h]; free_rects.pop(j); n -= 1; merged = True; continue
+                j += 1
+            i += 1
+    return free_rects
+
+def maxrects_packing_placement(cell_features, margin=0.0, bin_growth_factor=2.0):
+    if cell_features.shape[0] == 0:
+        return cell_features
+    cell_features = cell_features.clone()
+    widths = (cell_features[:, 4].float() + 2 * margin).tolist()
+    heights = (cell_features[:, 5].float() + 2 * margin).tolist()
+    areas = cell_features[:, 0].float()
+    order = torch.argsort(areas, descending=True).tolist()
+
+    total_area = float(areas.sum().item())
+    side = math.sqrt(total_area * 1.5) if total_area > 0 else 1.0
+    bin_w = bin_h = max(1.0, side)
+
+    free_rects = [[0.0, 0.0, bin_w, bin_h]]
+    placed = []  # list of placed rects (x, y, w, h) in lower-left coords
+
+    for idx in order:
+        w, h = widths[idx], heights[idx]
+        placed_ok = False
+
+        # attempt placing; allow trying multiple candidates
+        def try_place_once():
+            nonlocal free_rects, placed, placed_ok, bin_w, bin_h
+            # score candidates: (short_side_fit, area_fit, free_rect_index, fx, fy)
+            candidates = []
+            for i, fr in enumerate(free_rects):
+                fx, fy, fw, fh = fr
+                if w <= fw + 1e-9 and h <= fh + 1e-9:
+                    short_side = min(fw - w, fh - h)
+                    area_fit = fw * fh - w * h
+                    candidates.append((short_side, area_fit, i, fx, fy, fw, fh))
+            if not candidates:
+                return False
+            # sort by short_side then area
+            candidates.sort(key=lambda x: (x[0], x[1]))
+            for cand in candidates:
+                _, _, fr_i, fx, fy, fw, fh = cand
+                bx, by = fx, fy  # place at lower-left of free rect (can be improved)
+                placed_rect = (bx, by, w, h)
+                # collision check with existing placed rects
+                collide = False
+                for p in placed:
+                    if rects_overlap(placed_rect, p):
+                        collide = True; break
+                if collide:
+                    continue
+                # commit place
+                cell_features[idx, 2] = bx + w/2 - margin
+                cell_features[idx, 3] = by + h/2 - margin
+                placed.append(placed_rect)
+                # split all free_rects by this placed_rect
+                new_free = []
+                for fr in free_rects:
+                    fx, fy, fw, fh = fr
+                    # no intersection -> keep
+                    if bx >= fx + fw - 1e-9 or bx + w <= fx + 1e-9 or by >= fy + fh - 1e-9 or by + h <= fy + 1e-9:
+                        new_free.append(fr)
+                        continue
+                    # produce fragments (clipped)
+                    # left strip
+                    if bx > fx + 1e-9:
+                        new_free.append([fx, fy, bx - fx, fh])
+                    # right strip
+                    if bx + w < fx + fw - 1e-9:
+                        new_free.append([bx + w, fy, fx + fw - (bx + w), fh])
+                    # bottom strip
+                    if by > fy + 1e-9:
+                        left = max(fx, bx); right = min(fx + fw, bx + w)
+                        if right - left > 1e-9:
+                            new_free.append([left, fy, right - left, by - fy])
+                        else:
+                            new_free.append([fx, fy, fw, by - fy])
+                    # top strip
+                    if by + h < fy + fh - 1e-9:
+                        left = max(fx, bx); right = min(fx + fw, bx + w)
+                        if right - left > 1e-9:
+                            new_free.append([left, by + h, right - left, fy + fh - (by + h)])
+                        else:
+                            new_free.append([fx, by + h, fw, fy + fh - (by + h)])
+                # prune degenerate and contained
+                cleaned = []
+                for r in new_free:
+                    rx, ry, rw, rh = r
+                    if rw <= 1e-9 or rh <= 1e-9:
+                        continue
+                    skip = False
+                    for o in new_free:
+                        if r is o: continue
+                        if contained(r, o):
+                            skip = True; break
+                    if not skip:
+                        cleaned.append(r)
+                # merge nearby/adjacent free rects
+                free_rects = merge_free_rects(cleaned)
+                placed_ok = True
+                return True
+            return False
+
+        # try place; if fails expand bin and retry up to a few times
+        attempts = 0
+        while not placed_ok and attempts < 4:
+            if try_place_once():
+                break
+            # expand bin and add new free area on the right and top
+            attempts += 1
+            old_w, old_h = bin_w, bin_h
+            bin_w *= bin_growth_factor
+            bin_h *= bin_growth_factor
+            # add new free strips
+            free_rects.append([0.0, old_h, bin_w, bin_h - old_h])
+            free_rects.append([old_w, 0.0, bin_w - old_w, old_h])
+            free_rects = merge_free_rects(free_rects)
+
+        if not placed_ok:
+            # as a fallback place off-grid to avoid abortion (shouldn't happen with growth)
+            bx, by = 0.0, bin_h
+            cell_features[idx, 2] = bx + w/2 - margin
+            cell_features[idx, 3] = by + h/2 - margin
+            placed.append((bx, by, w, h))
+            bin_h += h
+            free_rects.append([0.0, by + h, bin_w, bin_h - (by + h)])
+            free_rects = merge_free_rects(free_rects)
+
+    # final sanity: assert no overlaps
+    for i in range(len(placed)):
+        for j in range(i+1, len(placed)):
+            if rects_overlap(placed[i], placed[j]):
+                raise RuntimeError("Overlap detected after packing. This should not happen.")
+
+    return cell_features
+
+# ==== LOSS FUNCTIONS ====
+
 def wirelength_attraction_loss(cell_features, pin_features, edge_list):
     """Calculate loss based on total wirelength to minimize routing.
 
@@ -451,10 +811,10 @@ def train_placement(
     pin_features,
     edge_list,
     num_epochs=None,
-    lr=0.7,
+    lr=0.75,
     lambda_wirelength=0.0,
-    lambda_overlap=10.0,
-    lambda_density=7.0,
+    lambda_overlap=1.0,
+    lambda_density=3.0,
     verbose=True,
     log_interval=100,
 ):
@@ -482,30 +842,49 @@ def train_placement(
     if num_epochs is None:
         N = cell_features.shape[0]
         if N <= 50:
-            num_epochs = 200
+            num_epochs = 20
+            useDensity = False
         elif N <= 200:
-            num_epochs = 600
+            num_epochs = 50
+            useDensity = False
         else:
-            num_epochs = min(1100, int(1800 + (N - 200) * 1.5))
+            num_epochs = int(50 + (N - 200) * 0.6)
+            useDensity = True
 
-    # Will look into improving the conditonally defined loss function 
-    def loss_fn(cell_features_current):
-        wl_loss = wirelength_attraction_loss(
-        cell_features_current, pin_features, edge_list
-        )
-        overlap_loss = overlap_repulsion_loss(
+    # Conditionally define loss function
+    if useDensity:
+        def loss_fn(cell_features_current):
+            wl_loss = wirelength_attraction_loss(
             cell_features_current, pin_features, edge_list
-        )
-        density_loss = density_loss_bins(
+            )
+            overlap_loss = overlap_repulsion_loss(
+                cell_features_current, pin_features, edge_list
+            )
+            density_loss = density_loss_bins(
+                cell_features_current, pin_features, edge_list
+            )
+            loss_history["wirelength_loss"].append(wl_loss.item())
+            loss_history["overlap_loss"].append(overlap_loss.item())
+            loss_history["density_loss"].append(overlap_loss.item())
+            return lambda_wirelength * wl_loss + lambda_overlap * overlap_loss + lambda_density * density_loss 
+    else:
+        def loss_fn(cell_features_current):
+            wl_loss = wirelength_attraction_loss(
             cell_features_current, pin_features, edge_list
-        )
-        loss_history["wirelength_loss"].append(wl_loss.item())
-        loss_history["overlap_loss"].append(overlap_loss.item())
-        loss_history["density_loss"].append(overlap_loss.item())
-        return lambda_wirelength * wl_loss + lambda_overlap * overlap_loss + lambda_density * density_loss
+            )
+            overlap_loss = overlap_repulsion_loss(
+                cell_features_current, pin_features, edge_list
+            )
+            loss_history["wirelength_loss"].append(wl_loss.item())
+            loss_history["overlap_loss"].append(overlap_loss.item())
+            loss_history["density_loss"].append(None)
+            return lambda_wirelength * wl_loss + lambda_overlap * overlap_loss
+    
     # Clone features and create learnable positions
     cell_features = cell_features.clone()
     initial_cell_features = cell_features.clone()
+    
+    cell_features = shelf_packing_placement(cell_features)
 
     # Make only cell positions require gradients
     cell_positions = cell_features[:, 2:4].clone().detach()
