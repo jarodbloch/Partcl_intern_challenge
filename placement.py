@@ -355,19 +355,106 @@ def overlap_repulsion_loss(cell_features, pin_features, edge_list):
     # 3. Return a scalar loss that is zero when no overlaps exist
     #
     # Delete this placeholder and add your implementation:
+    
+    import torch.nn.functional as F
 
-    # Placeholder - returns a constant loss (REPLACE THIS!)
-    return torch.tensor(1.0, requires_grad=True)
+    # Cell data
+    x = cell_features[:, CellFeatureIdx.X]
+    y = cell_features[:, CellFeatureIdx.Y]
+    w = cell_features[:, CellFeatureIdx.WIDTH]
+    h = cell_features[:, CellFeatureIdx.HEIGHT]
+    area = cell_features[:, CellFeatureIdx.AREA]
+
+    xi, yi, wi, hi, areai = x[:, None], y[:, None], w[:, None], h[:, None], area[:, None]
+    xj, yj, wj, hj, areaj = x[None, :], y[None, :], w[None, :], h[None, :], area[None, :]
+
+    dx = torch.abs(xi - xj)
+    dy = torch.abs(yi - yj)
+
+    # Minimum separations
+    min_sep_x = 0.5 * (wi + wj)
+    min_sep_y = 0.5 * (hi + hj)
+
+    # Margins scaled by smaller dimension
+    margin_scale = 0.1
+    margin = margin_scale * torch.minimum(torch.minimum(wi, wj), torch.minimum(hi, hj))
+
+    # Using softplus for better convergence near boundaries
+    beta = 10.0
+    ox = F.softplus(min_sep_x + margin - dx, beta=beta)
+    oy = F.softplus(min_sep_y + margin - dy, beta=beta)
+
+    overlap_area = ox * oy
+
+    # Weighing by area
+    pair_weight = (areai * areaj) ** 0.25
+    overlap_pen = overlap_area * pair_weight
+
+    # Only sum upper triangle portion
+    loss = torch.triu(overlap_pen, diagonal=1).sum() / (N * (N - 1) // 2) # N is at least 2
+
+    return loss
+
+def density_loss_bins(cell_features, pin_features, edge_list, bins=10, target_density=0.6):
+    """Scuffed bin-based density loss for now as I figure out how to implement it better
+    Args:
+        cell_features: [N, 6] tensor with [area, num_pins, x, y, width, height]
+        pin_features: [P, 7] tensor with pin information (not used here)
+        edge_list: [E, 2] tensor with edges (not used here)
+        bins: Number of bins to group cells into
+        target_density: The target density of each bin
+    Returns:
+        Scalar loss value
+    """
+    device = cell_features.device
+    
+    # Cell data
+    x = cell_features[:, CellFeatureIdx.X]
+    y = cell_features[:, CellFeatureIdx.Y]
+    w = cell_features[:, CellFeatureIdx.WIDTH]
+    h = cell_features[:, CellFeatureIdx.HEIGHT]
+    area = cell_features[:, CellFeatureIdx.AREA]
+    
+    # Get bounds with padding
+    pad = 2.0
+    xmin = x.min() - pad
+    xmax = x.max() + pad
+    ymin = y.min() - pad
+    ymax = y.max() + pad
+    
+    # Bin sizes
+    bin_w = (xmax - xmin) / bins
+    bin_h = (ymax - ymin) / bins
+    bin_area = bin_w * bin_h
+    
+    # Assign each cell to a bin, currently using center point
+    bin_x = torch.clamp(((x - xmin) / bin_w).long(), 0, bins - 1)
+    bin_y = torch.clamp(((y - ymin) / bin_h).long(), 0, bins - 1)
+    bin_idx = bin_y * bins + bin_x  # Flatten to 1D
+    
+    # Accumulate area in each bin
+    density = torch.zeros(bins * bins, device=device)
+    density.scatter_add_(0, bin_idx, area)
+    
+    # Target capacity per bin
+    capacity = target_density * bin_area
+    
+    # Penalize overflow
+    overflow = torch.relu(density - capacity)
+    
+    # Mean square overflow
+    return overflow.pow(2).sum() / (bins * bins)
 
 
 def train_placement(
     cell_features,
     pin_features,
     edge_list,
-    num_epochs=1000,
-    lr=0.01,
-    lambda_wirelength=1.0,
+    num_epochs=None,
+    lr=0.7,
+    lambda_wirelength=0.0,
     lambda_overlap=10.0,
+    lambda_density=7.0,
     verbose=True,
     log_interval=100,
 ):
@@ -377,10 +464,11 @@ def train_placement(
         cell_features: [N, 6] tensor with cell properties
         pin_features: [P, 7] tensor with pin properties
         edge_list: [E, 2] tensor with edge connectivity
-        num_epochs: Number of optimization iterations
+        num_epochs: Number of optimization iterations, will scale with input size if None
         lr: Learning rate for Adam optimizer
         lambda_wirelength: Weight for wirelength loss
         lambda_overlap: Weight for overlap loss
+        lambda_density: Weight for density loss
         verbose: Whether to print progress
         log_interval: How often to print progress
 
@@ -390,6 +478,31 @@ def train_placement(
             - initial_cell_features: Original cell positions (for comparison)
             - loss_history: Loss values over time
     """
+    # Scale epochs based on input size if not specified
+    if num_epochs is None:
+        N = cell_features.shape[0]
+        if N <= 50:
+            num_epochs = 200
+        elif N <= 200:
+            num_epochs = 600
+        else:
+            num_epochs = min(1100, int(1800 + (N - 200) * 1.5))
+
+    # Will look into improving the conditonally defined loss function 
+    def loss_fn(cell_features_current):
+        wl_loss = wirelength_attraction_loss(
+        cell_features_current, pin_features, edge_list
+        )
+        overlap_loss = overlap_repulsion_loss(
+            cell_features_current, pin_features, edge_list
+        )
+        density_loss = density_loss_bins(
+            cell_features_current, pin_features, edge_list
+        )
+        loss_history["wirelength_loss"].append(wl_loss.item())
+        loss_history["overlap_loss"].append(overlap_loss.item())
+        loss_history["density_loss"].append(overlap_loss.item())
+        return lambda_wirelength * wl_loss + lambda_overlap * overlap_loss + lambda_density * density_loss
     # Clone features and create learnable positions
     cell_features = cell_features.clone()
     initial_cell_features = cell_features.clone()
@@ -406,6 +519,7 @@ def train_placement(
         "total_loss": [],
         "wirelength_loss": [],
         "overlap_loss": [],
+        "density_loss": [],
     }
 
     # Training loop
@@ -416,16 +530,8 @@ def train_placement(
         cell_features_current = cell_features.clone()
         cell_features_current[:, 2:4] = cell_positions
 
-        # Calculate losses
-        wl_loss = wirelength_attraction_loss(
-            cell_features_current, pin_features, edge_list
-        )
-        overlap_loss = overlap_repulsion_loss(
-            cell_features_current, pin_features, edge_list
-        )
-
         # Combined loss
-        total_loss = lambda_wirelength * wl_loss + lambda_overlap * overlap_loss
+        total_loss = loss_fn(cell_features_current)
 
         # Backward pass
         total_loss.backward()
@@ -438,15 +544,13 @@ def train_placement(
 
         # Record losses
         loss_history["total_loss"].append(total_loss.item())
-        loss_history["wirelength_loss"].append(wl_loss.item())
-        loss_history["overlap_loss"].append(overlap_loss.item())
 
         # Log progress
         if verbose and (epoch % log_interval == 0 or epoch == num_epochs - 1):
             print(f"Epoch {epoch}/{num_epochs}:")
             print(f"  Total Loss: {total_loss.item():.6f}")
-            print(f"  Wirelength Loss: {wl_loss.item():.6f}")
-            print(f"  Overlap Loss: {overlap_loss.item():.6f}")
+            print(f"  Wirelength Loss: {loss_history["wirelength_loss"][-1]:.6f}")
+            print(f"  Overlap Loss: {loss_history["overlap_loss"][-1].item():.6f}")
 
     # Create final cell features
     final_cell_features = cell_features.clone()
