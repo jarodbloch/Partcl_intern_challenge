@@ -838,18 +838,17 @@ def train_placement(
             - initial_cell_features: Original cell positions (for comparison)
             - loss_history: Loss values over time
     """
+    N = cell_features.shape[0]
     # Scale epochs based on input size if not specified
     if num_epochs is None:
-        N = cell_features.shape[0]
         if N <= 50:
             num_epochs = 20
-            useDensity = False
         elif N <= 200:
             num_epochs = 50
-            useDensity = False
         else:
             num_epochs = int(50 + (N - 200) * 0.6)
-            useDensity = True
+            
+    useDensity = (N > 200)
 
     # Conditionally define loss function
     if useDensity:
